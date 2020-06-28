@@ -2,8 +2,8 @@ import requests
 
 s = requests.Session()
 s.proxies = {
- "http": "http://192.168.100.21:8001",
- "https": "http://192.168.100.21:8001",
+ "http": "http://localhost:8000",
+ "https": "http://localhost:8001",
 }
 
 r = s.get("https://ya.ru")
