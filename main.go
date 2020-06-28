@@ -9,11 +9,12 @@ import (
   "net/url"
   "crypto/tls"
 	"strings"
-  "context"
+  // "context"
   "time"
   "bufio"
 	"strconv"
 	"os"
+	// "sort"
 	"github.com/gorilla/mux"
 	"encoding/json"
 )
@@ -31,45 +32,35 @@ var hopHeaders = []string{
 	"Upgrade",
 }
 
-type Route struct {
-    Name        string
-    Method      string
-    Pattern     string
-    HandlerFunc http.HandlerFunc
+func Index(w http.ResponseWriter, r *http.Request, listeners proxyListeners) {
+    // json.NewEncoder(w).Encode(listeners)
+		js, err := json.Marshal(listeners)
+		w.Header().Set("Content-Type", "application/json")
+		// json.NewEncoder(w).Encode(listeners)
+		if err != nil {
+	    http.Error(w, err.Error(), http.StatusInternalServerError)
+	    return
+	  }
+
+	  w.Write(js)
 }
 
-type Routes []Route
+func Reload(w http.ResponseWriter, r *http.Request, listeners proxyListeners, proxies string, firstPort int, lastPort int) {
 
-func NewRouter() *mux.Router {
+		listeners.reloadProxies(proxies, firstPort, lastPort)
+    // json.NewEncoder(w).Encode(listeners)
+		js, err := json.Marshal(nil)
+		w.Header().Set("Content-Type", "application/json")
+		// json.NewEncoder(w).Encode(listeners)
+		if err != nil {
+	    http.Error(w, err.Error(), http.StatusInternalServerError)
+	    return
+	  }
 
-    router := mux.NewRouter().StrictSlash(true)
-    for _, route := range apiRoutes {
-        router.
-            Methods(route.Method).
-            Path(route.Pattern).
-            Name(route.Name).
-            Handler(route.HandlerFunc)
-    }
-
-    return router
-}
-
-var apiRoutes = Routes{
-    Route{
-        "Index",
-        "GET",
-        "/",
-        Index,
-    },
+	  w.Write(js)
 }
 
 
-
-func Index(w http.ResponseWriter, r *http.Request) {
-    var listeners proxyListeners
-
-    json.NewEncoder(w).Encode(listeners)
-}
 
 func copyHeader(dst, src http.Header) {
 	for k, vv := range src {
@@ -124,12 +115,21 @@ type proxyServer struct {
 }
 
 type proxyServers []proxyServer
+//
+// type listenerStatus struct {
+// 	LastRequestUrl string				`json:"-"`
+// 	LastRequestSourceIP string	`json:"-"`
+// 	LastRequestStatus string		`json:"-"`
+// 	LastRequestTime time				`json:"-"`
+// }
 
 type proxyListener struct {
-  Proxy proxyServer 	`json:"proxyinfo"`
-  Address string
-  Port int						`json:"name"`
-  Server http.Server
+  Proxy proxyServer 		`json:"proxyserver"`
+  Address string				`json:"-"`
+  Port int							`json:"host_port"`
+  Server http.Server  	`json:"-"`
+	Listener net.Listener `json:"-"`
+	// Status listenerStatus `json:"status"`
 }
 
 type proxyListeners []proxyListener
@@ -208,30 +208,122 @@ func (p *proxyListener) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
   }
 }
 
-func (p *proxyListener) start(address string, proto string) {
+func (p *proxyListener) start(address string, proto string) (msg string) {
   p.Server = http.Server{Addr: address, Handler: p}
   p.Address = address
-  log.Println("Address", p.Address)
-  log.Println("Starting proxy server on", address)
+	// msg = "ok"
+  // log.Println("Address", p.Address)
+  log.Println("Starting proxy listener on port", p.Port, "matching proxy", p.Proxy.Host+":"+strconv.Itoa(p.Proxy.Port))
   if proto == "https" {
     if err := p.Server.ListenAndServeTLS("host.com.crt","host.com.key"); err != nil {
   		log.Print("ListenAndServe:", err)
   	}
   } else {
-    if err := p.Server.ListenAndServe(); err != nil {
-      log.Print("ListenAndServe:", err)
-  	}
+		listener, err := net.Listen("tcp", address)
+
+		// if err != nil && err.Error() == "bind: address already in use" {
+		//     msg = "port is used"
+		// }
+		if err != nil {
+				msg = "port is used"
+		    log.Print("Listen:", err)
+		} else {
+			p.Listener = listener
+			// p.Listener = listener
+			go p.Server.Serve(p.Listener)
+
+		}
+	  // if err := p.Server.Serve(p.Listener); err != nil {
+    //   log.Print("ListenAndServe:", err)
+  	// }
+
   }
+
+	return msg
 }
+
+// func (listeners *proxyListeners) removeProxy(listeners proxyListeners, proxy proxyListener) {
+// 	slice = append(slice[:i], slice[i+1:]...)
+// }
 
 
 func (p *proxyListener) shutdown() {
-  log.Println("Stopping proxy server on", p.Address)
-  if err := p.Server.Shutdown(context.Background()); err != nil {
+	log.Println("Stopping proxy listener on port", p.Port, "matching proxy", p.Proxy.Host+":"+strconv.Itoa(p.Proxy.Port))
+  // log.Println("Stopping proxy server on", p.Address)
+	// kek := &p.Listener
+	// log.Print(&p.Listener)
+  if err := p.Listener.Close(); err != nil {
       log.Print(err)
   }
 }
 
+func RemoveIndex(s []proxyListener, index int) []proxyListener {
+	return append(s[:index], s[index+1:]...)
+}
+
+func (listeners *proxyListeners) reloadProxies(proxyList string, firstPort int, lastPort int) {
+	proxyServers := parseProxyFile(proxyList)
+
+	var currentPort = firstPort
+	for i, listener := range *listeners {
+		matcher := 0
+		for _, proxy := range proxyServers {
+        if listener.Proxy.Host == proxy.Host && listener.Proxy.Port == proxy.Port {
+				matcher = 1
+        }
+    }
+		if matcher == 0 {
+			if listener.Proxy.Host != "localhost" {
+				listener.shutdown()
+				*listeners = RemoveIndex(*listeners, i)
+				// *listeners = append(listeners[:i], listeners[i+1:]...)
+
+				// listener = proxyListener{Proxy: proxyServer{Host:"",Port: 0}, Port: 0}
+			}
+		}
+	}
+	for _, proxy := range proxyServers {
+		if currentPort < lastPort {
+			IteratePort:
+			for _, listener := range *listeners {
+				if listener.Port == currentPort {
+					// port is occupied
+					currentPort++
+					goto IteratePort
+				}
+			}
+			// if len(*listeners) > 0 {
+			  matcher := 0
+				for _, listener := range *listeners {
+					if (proxy.Host == listener.Proxy.Host && proxy.Port == listener.Proxy.Port) {
+						log.Print("Proxy "+proxy.Host+":"+strconv.Itoa(proxy.Port)+" is known, matching "+strconv.Itoa(listener.Port)+" skipping")
+						matcher = 1
+					}
+				}
+				if matcher == 0 {
+					log.Print("Proxy "+proxy.Host+":"+strconv.Itoa(proxy.Port)+" is not known, adding")
+					listener := proxyListener{Proxy: proxy, Port: currentPort}
+					msg := listener.start("0.0.0.0:"+strconv.Itoa(currentPort),"")
+					if msg == "port is used" {
+						currentPort++
+					} else {
+						*listeners = append(*listeners, listener)
+						currentPort++
+					}
+				}
+			// } else {
+			//  	listener := proxyListener{Proxy: proxy, Port: currentPort}
+			//  	msg := listener.start("0.0.0.0:"+strconv.Itoa(currentPort),"")
+			//  	if msg == "port is used" {
+			//  		currentPort++
+			//  	} else {
+			//  		*listeners = append(*listeners, listener)
+			//  		currentPort++
+			//  	}
+		 // }
+		}
+	}
+}
 
 
 func main() {
@@ -242,8 +334,8 @@ func main() {
   flag.StringVar(&keyPath, "key", "server.key", "path to key file")
   var proto string
   flag.StringVar(&proto, "proto", "https", "Proxy protocol (http or https)")
-	var startPort int
-	flag.IntVar(&startPort, "start-port", 8000, "First port in range where application will listen")
+	var firstPort int
+	flag.IntVar(&firstPort, "first-port", 8000, "First port in range where application will listen")
 	var lastPort int
 	flag.IntVar(&lastPort, "last-port", 60000, "First port in range where application will listen")
 	var statusPort int
@@ -252,27 +344,24 @@ func main() {
 	flag.StringVar(&proxyList, "proxy-list", "./proxies.txt", "File which containing list of http/https proxies in host:port format")
 
 	flag.Parse()
-	proxies := parseProxyFile(proxyList)
-	flag.Parse()
-
-	var currentPort = startPort
 
 	var listeners proxyListeners
 
-	for _, proxy := range proxies {
-		if currentPort < lastPort {
-			listener := proxyListener{Proxy: proxy, Port: currentPort}
-			go listener.start("0.0.0.0:"+strconv.Itoa(currentPort),"")
-			listeners = append(listeners, listener)
-			currentPort++
-		}
-	}
+	listeners = append(listeners,proxyListener{Proxy: proxyServer{Host:"localhost",Port: 7090}, Port: 7090})
+	listeners.reloadProxies(proxyList, firstPort, lastPort)
 
+	r := mux.NewRouter()
+	r.HandleFunc("/", func (response http.ResponseWriter, request *http.Request) {
+		Index(response, request, listeners)
+	}).Methods("GET")
+	r.HandleFunc("/reload", func (response http.ResponseWriter, request *http.Request) {
+		listeners.reloadProxies(proxyList, firstPort, lastPort)
+	}).Methods("GET")
 
-	router := NewRouter()
+	// log.Fatal(http.ListenAndServe(":"+strconv.Itoa(statusPort), r))
+	go http.ListenAndServe(":"+strconv.Itoa(statusPort), r)
 
-	log.Fatal(http.ListenAndServe(":"+strconv.Itoa(statusPort), router))
-
+	// log.Print(listeners)
   select {}
 
 }
